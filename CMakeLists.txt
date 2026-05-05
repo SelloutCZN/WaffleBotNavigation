@@ -17,6 +17,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 
 # Install Python modules
 ament_python_install_package(${PROJECT_NAME}_modules)
@@ -26,6 +27,7 @@ install(PROGRAMS
   scripts/basic_velocity_control.py
   scripts/stop_me.py
   ele434_team07_2026_modules/explorer_node.py
+  ele434_team07_2026_modules/frontier_nav.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -8,20 +8,21 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 
 
 class RobotState(Enum):
-    FORWARD = 1
+    SEEK_FRONTIER = 1
     TURN_LEFT = 2
     TURN_RIGHT = 3
     ESCAPE = 4
 
 
-class ExplorerNode(Node):
+class FrontierNavNode(Node):
     def __init__(self):
-        super().__init__('explorer_node')
+        super().__init__('frontier_nav')
 
+        # Reuse existing launch parameters
         self.declare_parameter('forward_speed', 0.14)
         self.declare_parameter('turn_speed', 0.9)
         self.declare_parameter('slow_turn_forward_speed', 0.04)
@@ -41,12 +42,15 @@ class ExplorerNode(Node):
 
         self.declare_parameter('max_runtime', 90.0)
 
-        # Visited-memory parameters
-        self.declare_parameter('visited_cell_size', 0.40)
-        self.declare_parameter('visited_lookahead', 0.80)
-        self.declare_parameter('visited_weight', 0.25)
-        self.declare_parameter('visit_turn_gain', 0.18)
-        self.declare_parameter('visit_mark_radius_cells', 1)
+        # Frontier-specific parameters
+        self.declare_parameter('goal_reach_dist', 0.35)
+        self.declare_parameter('frontier_min_unknown_neighbors', 1)
+        self.declare_parameter('frontier_sample_stride', 2)
+        self.declare_parameter('goal_heading_gain', 1.2)
+        self.declare_parameter('max_goal_turn', 0.7)
+        self.declare_parameter('goal_refresh_period', 2.0)
+        self.declare_parameter('min_frontier_distance', 0.6)
+        self.declare_parameter('max_frontier_distance', 6.0)
 
         self.forward_speed = self.get_parameter('forward_speed').value
         self.turn_speed = self.get_parameter('turn_speed').value
@@ -67,24 +71,29 @@ class ExplorerNode(Node):
 
         self.max_runtime = self.get_parameter('max_runtime').value
 
-        self.visited_cell_size = self.get_parameter('visited_cell_size').value
-        self.visited_lookahead = self.get_parameter('visited_lookahead').value
-        self.visited_weight = self.get_parameter('visited_weight').value
-        self.visit_turn_gain = self.get_parameter('visit_turn_gain').value
-        self.visit_mark_radius_cells = self.get_parameter('visit_mark_radius_cells').value
+        self.goal_reach_dist = self.get_parameter('goal_reach_dist').value
+        self.frontier_min_unknown_neighbors = self.get_parameter('frontier_min_unknown_neighbors').value
+        self.frontier_sample_stride = self.get_parameter('frontier_sample_stride').value
+        self.goal_heading_gain = self.get_parameter('goal_heading_gain').value
+        self.max_goal_turn = self.get_parameter('max_goal_turn').value
+        self.goal_refresh_period = self.get_parameter('goal_refresh_period').value
+        self.min_frontier_distance = self.get_parameter('min_frontier_distance').value
+        self.max_frontier_distance = self.get_parameter('max_frontier_distance').value
 
         self.cmd_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.state = RobotState.FORWARD
+        self.state = RobotState.SEEK_FRONTIER
         self.state_time = 0.0
         self.control_dt = 0.1
 
         self.scan_ready = False
         self.odom_ready = False
+        self.map_ready = False
         self.run_finished = False
 
         self.front_dist = float('inf')
@@ -96,23 +105,18 @@ class ExplorerNode(Node):
         self.robot_y = 0.0
         self.robot_yaw = 0.0
 
+        self.map_msg = None
+        self.goal_x = None
+        self.goal_y = None
+        self.last_goal_update_time = 0.0
+
         self.min_valid_range = 0.05
         self.max_valid_range = 3.5
 
         self.preferred_turn_left = True
         self.start_time = self.get_clock().now().nanoseconds
 
-        # key: (ix, iy), value: visit count
-        self.visited_cells = {}
-
-        self.get_logger().info(
-            f'Explorer node started. '
-            f'forward_speed={self.forward_speed}, '
-            f'turn_speed={self.turn_speed}, '
-            f'stop_dist={self.stop_dist}, '
-            f'caution_dist={self.caution_dist}, '
-            f'max_runtime={self.max_runtime}'
-        )
+        self.get_logger().info('Frontier navigation node started.')
 
     def odom_callback(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
@@ -129,14 +133,16 @@ class ExplorerNode(Node):
 
         self.odom_ready = True
 
+    def map_callback(self, msg: OccupancyGrid):
+        self.map_msg = msg
+        self.map_ready = True
+
     def scan_callback(self, msg: LaserScan):
         ranges = list(msg.ranges)
-        n = len(ranges)
-
-        if n == 0:
+        if len(ranges) == 0:
             return
 
-        angles = [msg.angle_min + i * msg.angle_increment for i in range(n)]
+        angles = [msg.angle_min + i * msg.angle_increment for i in range(len(ranges))]
 
         def wrap_deg(deg):
             if deg < -180.0:
@@ -149,11 +155,9 @@ class ExplorerNode(Node):
             vals = []
             for r, a in zip(ranges, angles):
                 deg = wrap_deg(math.degrees(a))
-
                 if angle_deg_min <= deg <= angle_deg_max:
                     if math.isfinite(r) and self.min_valid_range < r < self.max_valid_range:
                         vals.append(r)
-
             if not vals:
                 return float('inf')
             return min(vals)
@@ -181,42 +185,6 @@ class ExplorerNode(Node):
 
         self.scan_ready = True
 
-    def world_to_cell(self, x, y):
-        ix = int(round(x / self.visited_cell_size))
-        iy = int(round(y / self.visited_cell_size))
-        return ix, iy
-
-    def mark_visited(self):
-        if not self.odom_ready:
-            return
-
-        center_ix, center_iy = self.world_to_cell(self.robot_x, self.robot_y)
-
-        for dx in range(-self.visit_mark_radius_cells, self.visit_mark_radius_cells + 1):
-            for dy in range(-self.visit_mark_radius_cells, self.visit_mark_radius_cells + 1):
-                key = (center_ix + dx, center_iy + dy)
-                self.visited_cells[key] = self.visited_cells.get(key, 0) + 1
-
-    def projected_visit_cost(self, relative_angle_deg):
-        if not self.odom_ready:
-            return 0.0
-
-        samples = [0.6 * self.visited_lookahead, self.visited_lookahead, 1.4 * self.visited_lookahead]
-        total = 0.0
-
-        heading = self.robot_yaw + math.radians(relative_angle_deg)
-
-        for d in samples:
-            px = self.robot_x + d * math.cos(heading)
-            py = self.robot_y + d * math.sin(heading)
-            key = self.world_to_cell(px, py)
-            total += self.visited_cells.get(key, 0)
-
-        return total / len(samples)
-
-    def clamp(self, value, low, high):
-        return max(low, min(high, value))
-
     def set_state(self, new_state: RobotState):
         if self.state != new_state:
             old_state = self.state
@@ -224,6 +192,95 @@ class ExplorerNode(Node):
             self.state_time = 0.0
             self.get_logger().info(
                 f'STATE switched: {old_state.value} {old_state.name} -> {new_state.value} {new_state.name}'
+            )
+
+    def clamp(self, value, low, high):
+        return max(low, min(high, value))
+
+    def angle_wrap(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def map_index(self, mx, my, width):
+        return my * width + mx
+
+    def cell_to_world(self, mx, my):
+        info = self.map_msg.info
+        wx = info.origin.position.x + (mx + 0.5) * info.resolution
+        wy = info.origin.position.y + (my + 0.5) * info.resolution
+        return wx, wy
+
+    def world_to_cell(self, wx, wy):
+        info = self.map_msg.info
+        mx = int((wx - info.origin.position.x) / info.resolution)
+        my = int((wy - info.origin.position.y) / info.resolution)
+        return mx, my
+
+    def is_in_map(self, mx, my):
+        info = self.map_msg.info
+        return 0 <= mx < info.width and 0 <= my < info.height
+
+    def is_frontier_cell(self, mx, my, data, width, height):
+        idx = self.map_index(mx, my, width)
+        if data[idx] != 0:
+            return False
+
+        unknown_neighbors = 0
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx = mx + dx
+            ny = my + dy
+            if 0 <= nx < width and 0 <= ny < height:
+                nidx = self.map_index(nx, ny, width)
+                if data[nidx] == -1:
+                    unknown_neighbors += 1
+
+        return unknown_neighbors >= self.frontier_min_unknown_neighbors
+
+    def choose_frontier_goal(self):
+        if not self.map_ready or not self.odom_ready:
+            return
+
+        info = self.map_msg.info
+        width = info.width
+        height = info.height
+        data = self.map_msg.data
+
+        best_goal = None
+        best_score = float('inf')
+
+        stride = max(1, int(self.frontier_sample_stride))
+
+        for my in range(1, height - 1, stride):
+            for mx in range(1, width - 1, stride):
+                if not self.is_frontier_cell(mx, my, data, width, height):
+                    continue
+
+                wx, wy = self.cell_to_world(mx, my)
+
+                dx = wx - self.robot_x
+                dy = wy - self.robot_y
+                dist = math.hypot(dx, dy)
+
+                if dist < self.min_frontier_distance or dist > self.max_frontier_distance:
+                    continue
+
+                heading = math.atan2(dy, dx)
+                heading_error = abs(self.angle_wrap(heading - self.robot_yaw))
+
+                # Prefer nearby frontiers, but mildly prefer those roughly ahead
+                score = dist + 0.4 * heading_error
+
+                if score < best_score:
+                    best_score = score
+                    best_goal = (wx, wy)
+
+        if best_goal is not None:
+            self.goal_x, self.goal_y = best_goal
+            self.get_logger().info(
+                f'New frontier goal: x={self.goal_x:.2f}, y={self.goal_y:.2f}'
             )
 
     def control_loop(self):
@@ -241,82 +298,89 @@ class ExplorerNode(Node):
 
         self.state_time += self.control_dt
 
-        if self.odom_ready:
-            self.mark_visited()
-
         front_blocked = self.front_dist < self.stop_dist
         rear_blocked = self.rear_dist < self.rear_block_dist
         left_tight = self.left_dist < self.side_block_dist
         right_tight = self.right_dist < self.side_block_dist
 
-        left_visit = self.projected_visit_cost(45.0)
-        right_visit = self.projected_visit_cost(-45.0)
-        forward_visit = self.projected_visit_cost(0.0)
+        now_sec = elapsed_time
+        if self.goal_x is None or self.goal_y is None or (now_sec - self.last_goal_update_time) > self.goal_refresh_period:
+            self.choose_frontier_goal()
+            self.last_goal_update_time = now_sec
 
         cmd = TwistStamped()
 
-        if self.state == RobotState.FORWARD:
+        if self.state == RobotState.SEEK_FRONTIER:
             if front_blocked:
-                left_score = self.left_dist - self.visited_weight * left_visit
-                right_score = self.right_dist - self.visited_weight * right_visit
-
-                if left_score > right_score + 0.05:
+                if self.left_dist > self.right_dist + 0.05:
                     self.preferred_turn_left = True
                     self.set_state(RobotState.TURN_LEFT)
-                elif right_score > left_score + 0.05:
+                elif self.right_dist > self.left_dist + 0.05:
                     self.preferred_turn_left = False
                     self.set_state(RobotState.TURN_RIGHT)
                 else:
                     self.preferred_turn_left = random.choice([True, False])
                     self.set_state(RobotState.ESCAPE)
             else:
-                if self.front_dist < self.caution_dist:
-                    cmd.twist.linear.x = self.caution_speed
+                if self.goal_x is not None and self.goal_y is not None:
+                    dx = self.goal_x - self.robot_x
+                    dy = self.goal_y - self.robot_y
+                    goal_dist = math.hypot(dx, dy)
+
+                    if goal_dist < self.goal_reach_dist:
+                        self.goal_x = None
+                        self.goal_y = None
+                    else:
+                        goal_heading = math.atan2(dy, dx)
+                        heading_error = self.angle_wrap(goal_heading - self.robot_yaw)
+
+                        if self.front_dist < self.caution_dist:
+                            cmd.twist.linear.x = self.caution_speed
+                        else:
+                            cmd.twist.linear.x = self.forward_speed
+
+                        obstacle_steer = 0.0
+                        if self.left_dist < self.right_dist - 0.08:
+                            obstacle_steer = -0.25
+                        elif self.right_dist < self.left_dist - 0.08:
+                            obstacle_steer = 0.25
+
+                        goal_steer = self.goal_heading_gain * heading_error
+                        goal_steer = self.clamp(goal_steer, -self.max_goal_turn, self.max_goal_turn)
+
+                        cmd.twist.angular.z = self.clamp(obstacle_steer + goal_steer, -1.0, 1.0)
                 else:
-                    cmd.twist.linear.x = self.forward_speed
+                    if self.front_dist < self.caution_dist:
+                        cmd.twist.linear.x = self.caution_speed
+                    else:
+                        cmd.twist.linear.x = self.forward_speed
 
-                obstacle_steer = 0.0
-                if self.left_dist < self.right_dist - 0.08:
-                    obstacle_steer = -0.25
-                elif self.right_dist < self.left_dist - 0.08:
-                    obstacle_steer = 0.25
-
-                visit_steer = 0.0
-                if left_visit + 0.5 < right_visit:
-                    visit_steer = self.visit_turn_gain
-                elif right_visit + 0.5 < left_visit:
-                    visit_steer = -self.visit_turn_gain
-
-                # If straight ahead is heavily revisited, encourage a gentle side bias
-                if forward_visit > min(left_visit, right_visit) + 1.0:
-                    if left_visit < right_visit:
-                        visit_steer += 0.08
-                    elif right_visit < left_visit:
-                        visit_steer -= 0.08
-
-                cmd.twist.angular.z = self.clamp(obstacle_steer + visit_steer, -0.5, 0.5)
+                    if self.left_dist < self.right_dist - 0.08:
+                        cmd.twist.angular.z = -0.25
+                    elif self.right_dist < self.left_dist - 0.08:
+                        cmd.twist.angular.z = 0.25
 
         elif self.state == RobotState.TURN_LEFT:
-            if front_blocked:
-                cmd.twist.linear.x = 0.0
-            else:
-                cmd.twist.linear.x = self.slow_turn_forward_speed
-
             cmd.twist.angular.z = self.turn_speed
 
-            if (not front_blocked and self.left_dist > self.caution_dist) or self.state_time > self.turn_duration:
-                self.set_state(RobotState.FORWARD)
-
-        elif self.state == RobotState.TURN_RIGHT:
             if front_blocked:
                 cmd.twist.linear.x = 0.0
             else:
                 cmd.twist.linear.x = self.slow_turn_forward_speed
 
+            if (not front_blocked and self.left_dist > self.caution_dist) or self.state_time > self.turn_duration:
+                self.set_state(RobotState.SEEK_FRONTIER)
+
+        elif self.state == RobotState.TURN_RIGHT:
             cmd.twist.angular.z = -self.turn_speed
 
+            if front_blocked:
+                cmd.twist.linear.x = 0.0
+            else:
+                cmd.twist.linear.x = self.slow_turn_forward_speed
+
             if (not front_blocked and self.right_dist > self.caution_dist) or self.state_time > self.turn_duration:
-                self.set_state(RobotState.FORWARD)
+                self.set_state(RobotState.SEEK_FRONTIER)
 
         elif self.state == RobotState.ESCAPE:
             if rear_blocked:
@@ -324,28 +388,16 @@ class ExplorerNode(Node):
             else:
                 cmd.twist.linear.x = -0.03
 
-            # Bias escape turn toward the less-visited side when possible
-            if left_visit + 0.5 < right_visit:
-                self.preferred_turn_left = True
-            elif right_visit + 0.5 < left_visit:
-                self.preferred_turn_left = False
-
             if self.preferred_turn_left:
                 cmd.twist.angular.z = self.turn_speed
             else:
                 cmd.twist.angular.z = -self.turn_speed
 
             if self.state_time > self.escape_duration:
-                self.set_state(RobotState.FORWARD)
+                self.set_state(RobotState.SEEK_FRONTIER)
 
-        if self.state == RobotState.FORWARD and front_blocked and left_tight and right_tight:
-            if left_visit + 0.5 < right_visit:
-                self.preferred_turn_left = True
-            elif right_visit + 0.5 < left_visit:
-                self.preferred_turn_left = False
-            else:
-                self.preferred_turn_left = random.choice([True, False])
-
+        if self.state == RobotState.SEEK_FRONTIER and front_blocked and left_tight and right_tight:
+            self.preferred_turn_left = random.choice([True, False])
             self.set_state(RobotState.ESCAPE)
 
         self.cmd_pub.publish(cmd)
@@ -353,7 +405,7 @@ class ExplorerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ExplorerNode()
+    node = FrontierNavNode()
 
     try:
         rclpy.spin(node)
