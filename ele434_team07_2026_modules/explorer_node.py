@@ -22,22 +22,22 @@ class ExplorerNode(Node):
     def __init__(self):
         super().__init__('explorer_node')
 
-        self.declare_parameter('forward_speed', 0.14)
+        self.declare_parameter('forward_speed', 0.24)
         self.declare_parameter('turn_speed', 0.9)
-        self.declare_parameter('slow_turn_forward_speed', 0.04)
-        self.declare_parameter('caution_speed', 0.12)
+        self.declare_parameter('slow_turn_forward_speed', 0.14)
+        self.declare_parameter('caution_speed', 0.16)
 
-        self.declare_parameter('stop_dist', 0.38)
-        self.declare_parameter('caution_dist', 0.58)
-        self.declare_parameter('side_block_dist', 0.30)
-        self.declare_parameter('rear_block_dist', 0.25)
+        self.declare_parameter('stop_dist', 0.25)
+        self.declare_parameter('caution_dist', 0.4)
+        self.declare_parameter('side_block_dist', 0.18)
+        self.declare_parameter('rear_block_dist', 0.17)
 
         self.declare_parameter('turn_duration', 0.9)
         self.declare_parameter('escape_duration', 1.7)
 
-        self.declare_parameter('front_half_angle_deg', 45.0)
-        self.declare_parameter('rear_half_angle_deg', 45.0)
-        self.declare_parameter('side_half_angle_deg', 45.0)
+        self.declare_parameter('front_half_angle_deg', 30.0)
+        self.declare_parameter('rear_half_angle_deg', 30.0)
+        self.declare_parameter('side_half_angle_deg', 60.0)
 
         self.declare_parameter('max_runtime', 90.0)
 
@@ -249,8 +249,8 @@ class ExplorerNode(Node):
         left_tight = self.left_dist < self.side_block_dist
         right_tight = self.right_dist < self.side_block_dist
 
-        left_visit = self.projected_visit_cost(45.0)
-        right_visit = self.projected_visit_cost(-45.0)
+        left_visit = self.projected_visit_cost(0)
+        right_visit = self.projected_visit_cost(0)
         forward_visit = self.projected_visit_cost(0.0)
 
         cmd = TwistStamped()

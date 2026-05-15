@@ -1,0 +1,11 @@
+# ROS 2 Colcon generated folders
+build/
+install/
+log/
+
+# Python artifacts (if you are writing Python nodes)
+__pycache__/
+*.pyc
+
+# OS generated files
+.DS_Store
