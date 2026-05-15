@@ -2,16 +2,15 @@
 """
 Zone-visiting explorer for ELE434 Team 07.
 
-Strategy: drive to the centre of each unvisited outer zone, then inner zones.
-A zone is "visited" when the robot centre is within `zone_visit_radius` of
-the zone centre (simple Euclidean check, not a margin-based boundary check).
+Architecture: commit to one zone at a time.
+  - Pick the best unvisited outer zone and send Nav2 there.
+  - Do NOT switch while the goal is active, UNLESS the target zone
+    is visited by passing through it (rare) or the goal times out.
+  - On Nav2 SUCCEEDED or ABORTED, immediately pick the next best zone.
+  - Outer zones before inner zones.
 
-Key fixes vs previous version:
-  - Visit detection uses distance-to-zone-centre, not a margin inside the
-    boundary. This is simpler and doesn't break at boundary edges.
-  - xy_goal_tolerance tightened to 0.20 m so the robot actually reaches
-    the zone centre before Nav2 declares success.
-  - Goal switch margin reduced so the robot switches promptly after success.
+This prevents the chaotic goal-switching that happened when the score
+was re-evaluated every second while the robot was in flight.
 """
 
 import math
@@ -31,27 +30,18 @@ class ZoneExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
 
-        # ------------------------------------------------------------------
-        # Parameters
-        # ------------------------------------------------------------------
         self.declare_parameter('max_runtime', 90.0)
-        self.declare_parameter('planning_period', 1.0)
-        self.declare_parameter('goal_timeout', 30.0)
-
+        self.declare_parameter('planning_period', 0.5)
+        self.declare_parameter('goal_timeout', 35.0)
         self.declare_parameter('arena_half_size', 2.0)
         self.declare_parameter('zone_size', 1.0)
-        # A zone is "visited" when robot centre is within this distance of
-        # the zone centre. 0.40 m means clearly inside a 1 m² zone.
         self.declare_parameter('zone_visit_radius', 0.40)
-
         self.declare_parameter('outer_zone_bonus', 8.0)
-        self.declare_parameter('visited_zone_penalty', 30.0)
-        self.declare_parameter('heading_score_gain', 0.3)
+        self.declare_parameter('visited_zone_penalty', 50.0)
+        self.declare_parameter('heading_score_gain', 0.10)
         self.declare_parameter('distance_score_gain', 1.0)
-
-        self.declare_parameter('goal_switch_margin', 1.5)
-        self.declare_parameter('failed_goal_penalty', 10.0)
-        self.declare_parameter('failed_goal_memory_seconds', 30.0)
+        self.declare_parameter('failed_goal_penalty', 15.0)
+        self.declare_parameter('failed_goal_memory_seconds', 40.0)
 
         gp = lambda n: self.get_parameter(n).value
         self.max_runtime                = float(gp('max_runtime'))
@@ -64,16 +54,11 @@ class ZoneExplorer(Node):
         self.visited_zone_penalty       = float(gp('visited_zone_penalty'))
         self.heading_score_gain         = float(gp('heading_score_gain'))
         self.distance_score_gain        = float(gp('distance_score_gain'))
-        self.goal_switch_margin         = float(gp('goal_switch_margin'))
         self.failed_goal_penalty        = float(gp('failed_goal_penalty'))
         self.failed_goal_memory_seconds = float(gp('failed_goal_memory_seconds'))
 
-        # All 16 zone ids: i,j in {-2,-1,0,1}
         self._all_zone_ids = [(i, j) for i in range(-2, 2) for j in range(-2, 2)]
 
-        # ------------------------------------------------------------------
-        # ROS interfaces
-        # ------------------------------------------------------------------
         map_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -85,9 +70,6 @@ class ZoneExplorer(Node):
         self.stop_pub   = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # ------------------------------------------------------------------
-        # State
-        # ------------------------------------------------------------------
         self.map_ready  = False
         self.robot_x    = self.robot_y = self.robot_yaw = 0.0
         self.odom_ready = False
@@ -95,15 +77,14 @@ class ZoneExplorer(Node):
         self.origin_x = self.origin_y = self.origin_yaw = 0.0
         self.zone_origin_captured = False
 
-        self.visited_zones = set()   # set of (i, j) zone ids
-
+        self.visited_zones = set()
         self.goal_active            = False
         self.current_goal_handle    = None
         self.current_goal_zone      = None
         self.current_goal_xy        = None
-        self.current_goal_score     = float('inf')
         self.current_goal_send_time = 0.0
-        self.failed_goals           = []  # list of (wx, wy, expire_time)
+        self.failed_goals           = []
+        self._nav2_result_received  = False  # flag so we don't re-send while awaiting result
 
         self.start_time   = self.get_clock().now().nanoseconds * 1e-9
         self.initialized  = False
@@ -127,18 +108,42 @@ class ZoneExplorer(Node):
         return a
 
     @staticmethod
-    def is_outer_zone(zone_id):
-        i, j = zone_id
+    def is_outer(zid):
+        i, j = zid
         return not (i in (-1, 0) and j in (-1, 0))
 
-    def zone_centre_map(self, zone_id):
-        """Return (wx, wy) of zone centre in map/odom frame."""
-        i, j = zone_id
+    def zone_centre(self, zid):
+        i, j = zid
         zx = (i + 0.5) * self.zone_size
         zy = (j + 0.5) * self.zone_size
-        c  = math.cos(self.origin_yaw)
-        s  = math.sin(self.origin_yaw)
+        c = math.cos(self.origin_yaw)
+        s = math.sin(self.origin_yaw)
         return self.origin_x + zx * c - zy * s, self.origin_y + zx * s + zy * c
+
+    def _outer_remaining(self):
+        return [z for z in self._all_zone_ids
+                if z not in self.visited_zones and self.is_outer(z)]
+
+    def _score(self, zid):
+        wx, wy = self.zone_centre(zid)
+        dx, dy = wx - self.robot_x, wy - self.robot_y
+        dist = math.hypot(dx, dy)
+        heading_err = abs(self._angle_wrap(math.atan2(dy, dx) - self.robot_yaw))
+        score = self.distance_score_gain * dist + self.heading_score_gain * heading_err
+        if zid in self.visited_zones:
+            score += self.visited_zone_penalty
+        elif self.is_outer(zid):
+            score -= self.outer_zone_bonus
+        score += self._failed_cost(wx, wy)
+        return score, wx, wy
+
+    def _best_zone(self):
+        best, best_score, best_wx, best_wy = None, float('inf'), 0, 0
+        for zid in self._all_zone_ids:
+            s, wx, wy = self._score(zid)
+            if s < best_score:
+                best_score, best, best_wx, best_wy = s, zid, wx, wy
+        return (best, best_wx, best_wy, best_score) if best else None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -156,9 +161,11 @@ class ZoneExplorer(Node):
             self.init_timer.cancel()
             self.start_time = self.get_clock().now().nanoseconds * 1e-9
             self.explore_timer = self.create_timer(self.planning_period, self._explore_tick)
-            self.get_logger().info('Nav2, map, and odom ready — zone exploration timer running.')
+            self.get_logger().info(
+                f'Nav2, map, and odom ready — zone exploration running.\n'
+                f'Outer zones to visit: {self._outer_remaining()}'
+            )
             return
-
         missing = [n for n, ok in [('Nav2', nav_ready), ('map', map_ready), ('odom', odom_ready)] if not ok]
         self.get_logger().info(f'Still waiting on: {", ".join(missing)}.')
 
@@ -172,73 +179,47 @@ class ZoneExplorer(Node):
         if not self.zone_origin_captured:
             return
 
+        # Always update visited zones (robot may have passed through one)
         self.update_visited_zones()
         self._prune_failed_goals(elapsed)
 
-        # If current goal's zone is now visited, cancel immediately.
-        if (self.goal_active
-                and self.current_goal_zone is not None
-                and self.current_goal_zone in self.visited_zones):
-            self.get_logger().info(
-                f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} visited — picking next.')
-            self._cancel_current_goal()
+        # If we're awaiting a Nav2 result, don't do anything — wait for callback
+        if self._nav2_result_received:
+            return
 
-        # Hard timeout.
-        if self.goal_active and (elapsed - self.current_goal_send_time) > self.goal_timeout:
-            self.get_logger().warn(f'[t={elapsed:.1f}s] Goal timeout — re-planning.')
-            self._remember_failed_goal(elapsed)
-            self._cancel_current_goal()
-
+        # If goal is active, only intervene for:
+        #   1. The target zone was already visited (robot passed through on the way)
+        #   2. Hard timeout
         if self.goal_active:
-            target = self._choose_zone_goal(elapsed)
-            if target is not None:
-                zid, wx, wy, score = target
-                if score + self.goal_switch_margin < self.current_goal_score:
-                    self.get_logger().info(
-                        f'[t={elapsed:.1f}s] Switching to better zone {zid} '
-                        f'(score {score:.2f} vs {self.current_goal_score:.2f}).')
-                    self._cancel_current_goal()
-                    self._send_nav_goal(zid, wx, wy, score, elapsed)
+            # Visited en-route
+            if (self.current_goal_zone is not None
+                    and self.current_goal_zone in self.visited_zones):
+                self.get_logger().info(
+                    f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} visited en-route '
+                    f'— cancelling and picking next.')
+                self._nav2_result_received = True
+                self._cancel_current_goal()
+                self._pick_and_send(elapsed)
+            # Timeout
+            elif (elapsed - self.current_goal_send_time) > self.goal_timeout:
+                self.get_logger().warn(f'[t={elapsed:.1f}s] Goal timeout — re-planning.')
+                self._remember_failed_goal(elapsed)
+                self._nav2_result_received = True
+                self._cancel_current_goal()
+                self._pick_and_send(elapsed)
             return
 
-        target = self._choose_zone_goal(elapsed)
+        # No active goal — pick one
+        self._pick_and_send(elapsed)
+
+    def _pick_and_send(self, elapsed):
+        self._nav2_result_received = False
+        target = self._best_zone()
         if target is None:
-            outer_left = [z for z in self._all_zone_ids
-                          if z not in self.visited_zones and self.is_outer_zone(z)]
-            self.get_logger().info(
-                f'[t={elapsed:.1f}s] No zone goal. Outer remaining: {len(outer_left)}/12.')
+            self.get_logger().info(f'[t={elapsed:.1f}s] No zone goal available.')
             return
-
         zid, wx, wy, score = target
         self._send_nav_goal(zid, wx, wy, score, elapsed)
-
-    def _choose_zone_goal(self, elapsed):
-        best = None
-        best_score = float('inf')
-
-        for zid in self._all_zone_ids:
-            wx, wy = self.zone_centre_map(zid)
-            dx = wx - self.robot_x
-            dy = wy - self.robot_y
-            dist = math.hypot(dx, dy)
-
-            heading_err = abs(self._angle_wrap(math.atan2(dy, dx) - self.robot_yaw))
-
-            score = (self.distance_score_gain * dist
-                     + self.heading_score_gain * heading_err)
-
-            if zid in self.visited_zones:
-                score += self.visited_zone_penalty
-            elif self.is_outer_zone(zid):
-                score -= self.outer_zone_bonus
-
-            score += self._failed_goal_proximity_cost(wx, wy)
-
-            if score < best_score:
-                best_score = score
-                best = (zid, wx, wy, score)
-
-        return best
 
     def _end_run(self):
         if self.run_finished:
@@ -246,11 +227,10 @@ class ZoneExplorer(Node):
         self.run_finished = True
         self._cancel_current_goal()
         self._publish_stop()
-        outer = sum(1 for z in self.visited_zones if self.is_outer_zone(z))
+        outer = sum(1 for z in self.visited_zones if self.is_outer(z))
         self.get_logger().info(
-            f'[t=90.0s] Runtime elapsed. '
-            f'Outer zones visited: {outer}/12. '
-            f'All visited: {sorted(self.visited_zones)}'
+            f'[t=90.0s] DONE. Outer: {outer}/12. '
+            f'Visited: {sorted(self.visited_zones)}'
         )
         if self.explore_timer is not None:
             self.explore_timer.cancel()
@@ -262,27 +242,25 @@ class ZoneExplorer(Node):
         self.stop_pub.publish(zero)
 
     # ------------------------------------------------------------------
-    # Zone visit detection — distance to zone centre
+    # Zone tracking
     # ------------------------------------------------------------------
 
     def update_visited_zones(self):
         if not self.zone_origin_captured:
             return
-        for zid in self._all_zone_ids:
+        for zid in list(self._all_zone_ids):
             if zid in self.visited_zones:
                 continue
-            wx, wy = self.zone_centre_map(zid)
+            wx, wy = self.zone_centre(zid)
             dist = math.hypot(self.robot_x - wx, self.robot_y - wy)
             if dist <= self.zone_visit_radius:
                 self.visited_zones.add(zid)
-                kind  = 'OUTER' if self.is_outer_zone(zid) else 'inner'
-                outer = sum(1 for z in self.visited_zones if self.is_outer_zone(z))
-                outer_left = [z for z in self._all_zone_ids
-                              if z not in self.visited_zones and self.is_outer_zone(z)]
+                kind  = 'OUTER' if self.is_outer(zid) else 'inner'
+                outer = sum(1 for z in self.visited_zones if self.is_outer(z))
                 self.get_logger().info(
-                    f'[t={self.elapsed():.1f}s] ✓ Visited {kind} zone {zid} '
+                    f'[t={self.elapsed():.1f}s] ✓ {kind} zone {zid} '
                     f'(dist={dist:.2f}m). Outer: {outer}/12. '
-                    f'Remaining: {outer_left}'
+                    f'Remaining: {self._outer_remaining()}'
                 )
 
     # ------------------------------------------------------------------
@@ -299,9 +277,9 @@ class ZoneExplorer(Node):
     def _prune_failed_goals(self, elapsed):
         self.failed_goals = [fg for fg in self.failed_goals if fg[2] > elapsed]
 
-    def _failed_goal_proximity_cost(self, wx, wy):
+    def _failed_cost(self, wx, wy):
         for fx, fy, _ in self.failed_goals:
-            if math.hypot(wx - fx, wy - fy) < 0.6:
+            if math.hypot(wx - fx, wy - fy) < 0.5:
                 return self.failed_goal_penalty
         return 0.0
 
@@ -313,10 +291,9 @@ class ZoneExplorer(Node):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
-
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_yaw = math.atan2(siny, cosy)
         if not self.zone_origin_captured:
             self.origin_x   = self.robot_x
             self.origin_y   = self.robot_y
@@ -345,41 +322,41 @@ class ZoneExplorer(Node):
         goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
-        kind = 'OUTER' if self.is_outer_zone(zone_id) else 'inner'
-        outer = sum(1 for z in self.visited_zones if self.is_outer_zone(z))
+        kind  = 'OUTER' if self.is_outer(zone_id) else 'inner'
+        outer = sum(1 for z in self.visited_zones if self.is_outer(z))
         self.get_logger().info(
-            f'[t={elapsed:.1f}s] → {kind} zone {zone_id} centre '
+            f'[t={elapsed:.1f}s] → {kind} zone {zone_id} '
             f'({wx:.2f}, {wy:.2f}) score={score:.2f} [outer done: {outer}/12]'
         )
 
         self.goal_active            = True
         self.current_goal_zone      = zone_id
         self.current_goal_xy        = (wx, wy)
-        self.current_goal_score     = score
         self.current_goal_send_time = elapsed
+        self._nav2_result_received  = False
 
         future = self.nav_client.send_goal_async(goal_msg)
-        future.add_done_callback(self._goal_response_callback)
+        future.add_done_callback(self._goal_response_cb)
 
-    def _goal_response_callback(self, future):
+    def _goal_response_cb(self, future):
         try:
-            goal_handle = future.result()
+            gh = future.result()
         except Exception as exc:
             self.get_logger().error(f'send_goal_async failed: {exc}')
             self.goal_active = False
+            self._nav2_result_received = True
             return
-
-        if not goal_handle.accepted:
-            self.get_logger().warn('Nav2 rejected the goal.')
+        if not gh.accepted:
+            self.get_logger().warn('Nav2 rejected goal.')
             self._remember_failed_goal(self.elapsed())
-            self.goal_active         = False
+            self.goal_active = False
             self.current_goal_handle = None
+            self._nav2_result_received = True
             return
+        self.current_goal_handle = gh
+        gh.get_result_async().add_done_callback(self._goal_result_cb)
 
-        self.current_goal_handle = goal_handle
-        goal_handle.get_result_async().add_done_callback(self._goal_result_callback)
-
-    def _goal_result_callback(self, future):
+    def _goal_result_cb(self, future):
         elapsed = self.elapsed()
         try:
             wrapped = future.result()
@@ -387,16 +364,19 @@ class ZoneExplorer(Node):
             self.get_logger().error(f'get_result_async failed: {exc}')
             self.goal_active         = False
             self.current_goal_handle = None
+            self._nav2_result_received = True
+            self._pick_and_send(elapsed)
             return
 
         status = wrapped.status
-        outer  = sum(1 for z in self.visited_zones if self.is_outer_zone(z))
+        outer  = sum(1 for z in self.visited_zones if self.is_outer(z))
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info(
-                f'[t={elapsed:.1f}s] Goal SUCCEEDED. Outer visited: {outer}/12.')
+                f'[t={elapsed:.1f}s] Goal SUCCEEDED. Outer: {outer}/12. '
+                f'Remaining: {self._outer_remaining()}')
         elif status == GoalStatus.STATUS_ABORTED:
-            self.get_logger().warn(f'[t={elapsed:.1f}s] Goal ABORTED. Outer visited: {outer}/12.')
+            self.get_logger().warn(f'[t={elapsed:.1f}s] Goal ABORTED. Outer: {outer}/12.')
             self._remember_failed_goal(elapsed)
         elif status == GoalStatus.STATUS_CANCELED:
             self.get_logger().info(f'[t={elapsed:.1f}s] Goal CANCELED.')
@@ -407,7 +387,10 @@ class ZoneExplorer(Node):
         self.current_goal_handle  = None
         self.current_goal_zone    = None
         self.current_goal_xy      = None
-        self.current_goal_score   = float('inf')
+        self._nav2_result_received = True
+
+        # Immediately pick next zone.
+        self._pick_and_send(elapsed)
 
     def _cancel_current_goal(self):
         if self.current_goal_handle is not None:
