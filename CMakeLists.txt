@@ -28,11 +28,13 @@ install(PROGRAMS
   scripts/stop_me.py
   ele434_team07_2026_modules/explorer_node.py
   ele434_team07_2026_modules/frontier_nav.py
+  ele434_team07_2026_modules/cmd_vel_relay.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY
   launch
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 
