@@ -10,6 +10,7 @@
 # With 0.20 m tolerance the robot stops within 0.20 m of the centre,
 # which is well inside the 0.40 m visit radius.
 # =====================================================================
+# last updated 18:38 16/05/2026
 
 bt_navigator:
   ros__parameters:
@@ -54,7 +55,7 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.18
+      desired_linear_vel: 0.22
       lookahead_dist: 0.5
       min_lookahead_dist: 0.25
       max_lookahead_dist: 0.8
@@ -192,8 +193,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.18, 0.0, 1.0]
-    min_velocity: [-0.18, 0.0, -1.0]
+    max_velocity: [0.22, 0.0, 1.0]
+    min_velocity: [-0.22, 0.0, -1.0]
     max_accel: [2.5, 0.0, 3.0]
     max_decel: [-2.5, 0.0, -3.0]
     odom_topic: /odom

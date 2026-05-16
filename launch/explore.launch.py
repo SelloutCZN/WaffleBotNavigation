@@ -27,6 +27,7 @@ Real robot (default):
 Simulation:
     ros2 launch ele434_team07_2026 explore.launch.py use_sim_time:=true
 """
+# last updated 18:38 16/05/2026
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -123,47 +124,21 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-
-            # Runtime budget
-            'max_runtime': 1000.0,
-            'planning_period': 1.0,
-            'goal_timeout': 18.0,
-
-            # Frontier extraction
-            'cluster_min_size': 1,
-            'cluster_min_unknown_neighbours': 1,
-            'frontier_sample_stride': 1,
-            'clearance_radius_cells': 2,
-            'min_frontier_distance': 0.10,
-            'max_frontier_distance': 6.0,
-
-            # Zone-aware scoring (4 x 4 m arena, 16 zones of 1 m square)
+            'max_runtime': 90.0,
+            'goal_timeout': 35.0,
             'arena_half_size': 2.0,
             'zone_size': 1.0,
-            'zone_visit_margin': 0.12,
-            'outer_zone_bonus': 3.0,
-            'visited_zone_penalty': 1.5,
-            'inner_zone_penalty': 1.0,
-            'radial_score_gain': 0.6,
-            'heading_score_gain': 0.4,
+            'zone_visit_radius': 0.45,
+            'outer_zone_bonus': 8.0,
+            'visited_zone_penalty': 50.0,
+            'heading_score_gain': 0.10,
+            'distance_score_gain': 1.0,
+            'failed_goal_penalty': 15.0,
+            'failed_goal_memory_seconds': 40.0,
+            # Path to write the map when the run ends.
+            # frontier_nav.py calls map_saver_cli at t=max_runtime in sim time.
+            'map_output_path': map_output_base,
         }]
-    )
-
-    # ------------------------------------------------------------------
-    # Map saver — 2 s after the exploration window closes
-    # ------------------------------------------------------------------
-    save_map = TimerAction(
-        period=92.0,
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
-                    '-f', map_output_base,
-                    '--fmt', 'png',
-                ],
-                output='screen'
-            )
-        ]
     )
 
     return LaunchDescription([
@@ -172,5 +147,4 @@ def generate_launch_description():
         nav2_group,
         cmd_vel_relay,
         frontier_node,
-        save_map,
     ])

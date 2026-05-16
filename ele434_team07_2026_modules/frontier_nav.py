@@ -2,24 +2,32 @@
 """
 Zone-visiting explorer for ELE434 Team 07.
 
-Goal-sending architecture (final):
+Goal-sending architecture:
   Goals are sent from EXACTLY TWO places:
     1. _init_done() — once, on startup.
     2. _goal_result_cb() — once per Nav2 result (SUCCEEDED/ABORTED/CANCELED).
 
   The tick timer (_explore_tick) NEVER sends goals. It only:
     a. Checks for the hard timeout and cancels if needed.
-    b. Detects en-route zone visits and cancels so the callback
-       fires and picks the next zone.
-    c. Stops the run at t=90s.
+    b. Detects en-route zone visits and cancels so the callback picks next.
+    c. Saves the map and stops the run at t=max_runtime in sim/real time.
 
-  This eliminates the "goal-per-tick" abort storm that occurred when the
-  timer fired every 0.5 sim-seconds (~0.05 real seconds at 10% sim speed),
-  bypassing the wall-clock cooldown guard entirely.
+Map saving:
+  The node calls map_saver_cli itself at t=max_runtime (measured in
+  whatever time source the node is using — sim time or wall time).
+  This is more accurate than a TimerAction in the launch file, which
+  always uses wall-clock time and fires far too early in simulation.
+
+Zone visit radius:
+  0.45 m from zone centre. The Waffle's radius is 0.14 m, so this
+  requires the robot's centre to be within 0.45 m of the zone centre,
+  meaning the far edge of the robot is at least (0.50 - 0.45 - 0.14)
+  = -0.09 m from the zone boundary, i.e. the entire robot is inside.
 """
-# updated 17:13 16/05/2026
+# last updated 18:38 16/05/2026
 
 import math
+import subprocess
 
 import rclpy
 from rclpy.node import Node
@@ -40,13 +48,19 @@ class ZoneExplorer(Node):
         self.declare_parameter('goal_timeout', 35.0)
         self.declare_parameter('arena_half_size', 2.0)
         self.declare_parameter('zone_size', 1.0)
-        self.declare_parameter('zone_visit_radius', 0.40)
+        # 0.45 m: robot centre must be 0.45 m from zone centre.
+        # Zone half-width = 0.50 m, robot radius = 0.14 m.
+        # This guarantees the entire robot body is inside the zone.
+        self.declare_parameter('zone_visit_radius', 0.45)
         self.declare_parameter('outer_zone_bonus', 8.0)
         self.declare_parameter('visited_zone_penalty', 50.0)
         self.declare_parameter('heading_score_gain', 0.10)
         self.declare_parameter('distance_score_gain', 1.0)
         self.declare_parameter('failed_goal_penalty', 15.0)
         self.declare_parameter('failed_goal_memory_seconds', 40.0)
+        # Filesystem path (without extension) for the saved map.
+        # Leave blank to skip saving.
+        self.declare_parameter('map_output_path', '')
 
         gp = lambda n: self.get_parameter(n).value
         self.max_runtime                = float(gp('max_runtime'))
@@ -60,6 +74,7 @@ class ZoneExplorer(Node):
         self.distance_score_gain        = float(gp('distance_score_gain'))
         self.failed_goal_penalty        = float(gp('failed_goal_penalty'))
         self.failed_goal_memory_seconds = float(gp('failed_goal_memory_seconds'))
+        self.map_output_path            = str(gp('map_output_path'))
 
         self._all_zone_ids = [(i, j) for i in range(-2, 2) for j in range(-2, 2)]
 
@@ -92,11 +107,9 @@ class ZoneExplorer(Node):
         self.start_time   = self.get_clock().now().nanoseconds * 1e-9
         self.initialized  = False
         self.run_finished = False
+        self.map_saved    = False
 
-        # Init timer: polls until Nav2 + map + odom ready, then fires _init_done once.
-        self.init_timer = self.create_timer(0.5, self._init_tick)
-
-        # Tick timer: only for timeout/visit checks and end-of-run. Never sends goals.
+        self.init_timer    = self.create_timer(0.5, self._init_tick)
         self.explore_timer = None
 
         self.get_logger().info('Zone explorer launched, waiting for Nav2 and SLAM...')
@@ -171,15 +184,12 @@ class ZoneExplorer(Node):
             self.initialized = True
             self.init_timer.cancel()
             self.start_time = self.get_clock().now().nanoseconds * 1e-9
-
-            # Tick timer: 0.5 sim-second period for visit/timeout checks only.
+            # Tick at 0.5 s for visit/timeout monitoring only.
             self.explore_timer = self.create_timer(0.5, self._explore_tick)
-
             self.get_logger().info(
                 f'Nav2, map, and odom ready — starting zone exploration.\n'
                 f'Outer zones: {self._outer_remaining()}'
             )
-            # Send the very first goal.
             self._pick_and_send(0.0)
             return
 
@@ -189,10 +199,14 @@ class ZoneExplorer(Node):
     def _explore_tick(self):
         """
         Tick handler — monitoring only. NEVER calls _pick_and_send directly.
-        Only cancels the current goal when necessary; the cancellation triggers
+        Cancels the current goal when necessary; cancellation triggers
         _goal_result_cb which then calls _pick_and_send.
         """
         elapsed = self.elapsed()
+
+        # Save map at exactly t=max_runtime, before ending the run.
+        if elapsed >= self.max_runtime and not self.map_saved:
+            self._save_map(elapsed)
 
         if elapsed >= self.max_runtime:
             self._end_run()
@@ -205,9 +219,9 @@ class ZoneExplorer(Node):
         self._prune_failed_goals(elapsed)
 
         if not self.goal_active:
-            # No goal active and we're past startup — shouldn't happen normally,
-            # but guard against it (e.g. if a result callback was missed).
-            self.get_logger().warn(f'[t={elapsed:.1f}s] No active goal detected in tick — re-sending.')
+            # Guard: no active goal outside startup — shouldn't happen normally.
+            self.get_logger().warn(
+                f'[t={elapsed:.1f}s] No active goal in tick — re-sending.')
             self._pick_and_send(elapsed)
             return
 
@@ -215,9 +229,9 @@ class ZoneExplorer(Node):
         if (self.current_goal_zone is not None
                 and self.current_goal_zone in self.visited_zones):
             self.get_logger().info(
-                f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} visited en-route — cancelling.')
+                f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} '
+                f'visited en-route — cancelling.')
             self._cancel_current_goal()
-            # _goal_result_cb fires with STATUS_CANCELED → calls _pick_and_send
             return
 
         # Hard timeout.
@@ -225,13 +239,13 @@ class ZoneExplorer(Node):
             self.get_logger().warn(f'[t={elapsed:.1f}s] Goal timeout — cancelling.')
             self._remember_failed_goal(elapsed)
             self._cancel_current_goal()
-            # _goal_result_cb fires → calls _pick_and_send
             return
 
     def _pick_and_send(self, elapsed):
-        """Pick the best unvisited zone and send a Nav2 goal. Call only when no goal is active."""
+        """Pick the best unvisited zone and send a Nav2 goal."""
         if self.goal_active:
-            self.get_logger().warn(f'[t={elapsed:.1f}s] _pick_and_send called with goal still active — ignoring.')
+            self.get_logger().warn(
+                f'[t={elapsed:.1f}s] _pick_and_send called with goal active — ignoring.')
             return
 
         target = self._best_zone()
@@ -240,13 +254,30 @@ class ZoneExplorer(Node):
             return
 
         zid, wx, wy, score = target
-
         if zid in self.visited_zones:
             self.get_logger().info(
-                f'[t={elapsed:.1f}s] Best zone {zid} already visited — all zones done?')
+                f'[t={elapsed:.1f}s] Best zone {zid} already visited — all done?')
             return
 
         self._send_nav_goal(zid, wx, wy, score, elapsed)
+
+    def _save_map(self, elapsed):
+        """Call map_saver_cli to write the SLAM map. Runs once at t=max_runtime."""
+        self.map_saved = True
+        if not self.map_output_path:
+            self.get_logger().warn(
+                f'[t={elapsed:.1f}s] map_output_path not set — skipping map save.')
+            return
+        self.get_logger().info(
+            f'[t={elapsed:.1f}s] Saving map to {self.map_output_path}...')
+        try:
+            subprocess.Popen([
+                'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
+                '-f', self.map_output_path,
+                '--fmt', 'png',
+            ])
+        except Exception as exc:
+            self.get_logger().error(f'map_saver_cli failed to launch: {exc}')
 
     def _end_run(self):
         if self.run_finished:
@@ -397,7 +428,7 @@ class ZoneExplorer(Node):
 
         status = wrapped.status
 
-        # Mark any newly visited zones before scoring the next goal.
+        # Mark newly visited zones before scoring the next goal.
         self.update_visited_zones()
 
         outer = sum(1 for z in self.visited_zones if self.is_outer(z))
