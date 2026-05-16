@@ -2,16 +2,22 @@
 """
 Zone-visiting explorer for ELE434 Team 07.
 
-Architecture: commit to one zone at a time.
-  - Pick the best unvisited outer zone and send Nav2 there.
-  - Do NOT switch while the goal is active, UNLESS the target zone
-    is visited by passing through it (rare) or the goal times out.
-  - On Nav2 SUCCEEDED or ABORTED, immediately pick the next best zone.
-  - Outer zones before inner zones.
+Goal-sending architecture (final):
+  Goals are sent from EXACTLY TWO places:
+    1. _init_done() — once, on startup.
+    2. _goal_result_cb() — once per Nav2 result (SUCCEEDED/ABORTED/CANCELED).
 
-This prevents the chaotic goal-switching that happened when the score
-was re-evaluated every second while the robot was in flight.
+  The tick timer (_explore_tick) NEVER sends goals. It only:
+    a. Checks for the hard timeout and cancels if needed.
+    b. Detects en-route zone visits and cancels so the callback
+       fires and picks the next zone.
+    c. Stops the run at t=90s.
+
+  This eliminates the "goal-per-tick" abort storm that occurred when the
+  timer fired every 0.5 sim-seconds (~0.05 real seconds at 10% sim speed),
+  bypassing the wall-clock cooldown guard entirely.
 """
+# updated 17:13 16/05/2026
 
 import math
 
@@ -31,7 +37,6 @@ class ZoneExplorer(Node):
         super().__init__('frontier_explorer')
 
         self.declare_parameter('max_runtime', 90.0)
-        self.declare_parameter('planning_period', 0.5)
         self.declare_parameter('goal_timeout', 35.0)
         self.declare_parameter('arena_half_size', 2.0)
         self.declare_parameter('zone_size', 1.0)
@@ -45,7 +50,6 @@ class ZoneExplorer(Node):
 
         gp = lambda n: self.get_parameter(n).value
         self.max_runtime                = float(gp('max_runtime'))
-        self.planning_period            = float(gp('planning_period'))
         self.goal_timeout               = float(gp('goal_timeout'))
         self.arena_half_size            = float(gp('arena_half_size'))
         self.zone_size                  = float(gp('zone_size'))
@@ -84,13 +88,15 @@ class ZoneExplorer(Node):
         self.current_goal_xy        = None
         self.current_goal_send_time = 0.0
         self.failed_goals           = []
-        self._nav2_result_received  = False  # flag so we don't re-send while awaiting result
 
         self.start_time   = self.get_clock().now().nanoseconds * 1e-9
         self.initialized  = False
         self.run_finished = False
 
-        self.init_timer    = self.create_timer(0.5, self._init_tick)
+        # Init timer: polls until Nav2 + map + odom ready, then fires _init_done once.
+        self.init_timer = self.create_timer(0.5, self._init_tick)
+
+        # Tick timer: only for timeout/visit checks and end-of-run. Never sends goals.
         self.explore_timer = None
 
         self.get_logger().info('Zone explorer launched, waiting for Nav2 and SLAM...')
@@ -138,12 +144,17 @@ class ZoneExplorer(Node):
         return score, wx, wy
 
     def _best_zone(self):
-        best, best_score, best_wx, best_wy = None, float('inf'), 0, 0
+        best, best_score, best_wx, best_wy = None, float('inf'), 0.0, 0.0
         for zid in self._all_zone_ids:
             s, wx, wy = self._score(zid)
             if s < best_score:
                 best_score, best, best_wx, best_wy = s, zid, wx, wy
         return (best, best_wx, best_wy, best_score) if best else None
+
+    def _arrival_yaw(self, wx, wy):
+        """Face toward the arena centre on arrival so departure arcs inward."""
+        cx, cy = self.zone_centre((0, 0))
+        return math.atan2(cy - wy, cx - wx)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -160,16 +171,27 @@ class ZoneExplorer(Node):
             self.initialized = True
             self.init_timer.cancel()
             self.start_time = self.get_clock().now().nanoseconds * 1e-9
-            self.explore_timer = self.create_timer(self.planning_period, self._explore_tick)
+
+            # Tick timer: 0.5 sim-second period for visit/timeout checks only.
+            self.explore_timer = self.create_timer(0.5, self._explore_tick)
+
             self.get_logger().info(
-                f'Nav2, map, and odom ready — zone exploration running.\n'
-                f'Outer zones to visit: {self._outer_remaining()}'
+                f'Nav2, map, and odom ready — starting zone exploration.\n'
+                f'Outer zones: {self._outer_remaining()}'
             )
+            # Send the very first goal.
+            self._pick_and_send(0.0)
             return
+
         missing = [n for n, ok in [('Nav2', nav_ready), ('map', map_ready), ('odom', odom_ready)] if not ok]
         self.get_logger().info(f'Still waiting on: {", ".join(missing)}.')
 
     def _explore_tick(self):
+        """
+        Tick handler — monitoring only. NEVER calls _pick_and_send directly.
+        Only cancels the current goal when necessary; the cancellation triggers
+        _goal_result_cb which then calls _pick_and_send.
+        """
         elapsed = self.elapsed()
 
         if elapsed >= self.max_runtime:
@@ -179,46 +201,51 @@ class ZoneExplorer(Node):
         if not self.zone_origin_captured:
             return
 
-        # Always update visited zones (robot may have passed through one)
         self.update_visited_zones()
         self._prune_failed_goals(elapsed)
 
-        # If we're awaiting a Nav2 result, don't do anything — wait for callback
-        if self._nav2_result_received:
+        if not self.goal_active:
+            # No goal active and we're past startup — shouldn't happen normally,
+            # but guard against it (e.g. if a result callback was missed).
+            self.get_logger().warn(f'[t={elapsed:.1f}s] No active goal detected in tick — re-sending.')
+            self._pick_and_send(elapsed)
             return
 
-        # If goal is active, only intervene for:
-        #   1. The target zone was already visited (robot passed through on the way)
-        #   2. Hard timeout
-        if self.goal_active:
-            # Visited en-route
-            if (self.current_goal_zone is not None
-                    and self.current_goal_zone in self.visited_zones):
-                self.get_logger().info(
-                    f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} visited en-route '
-                    f'— cancelling and picking next.')
-                self._nav2_result_received = True
-                self._cancel_current_goal()
-                self._pick_and_send(elapsed)
-            # Timeout
-            elif (elapsed - self.current_goal_send_time) > self.goal_timeout:
-                self.get_logger().warn(f'[t={elapsed:.1f}s] Goal timeout — re-planning.')
-                self._remember_failed_goal(elapsed)
-                self._nav2_result_received = True
-                self._cancel_current_goal()
-                self._pick_and_send(elapsed)
+        # Cancel if target zone visited en-route.
+        if (self.current_goal_zone is not None
+                and self.current_goal_zone in self.visited_zones):
+            self.get_logger().info(
+                f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} visited en-route — cancelling.')
+            self._cancel_current_goal()
+            # _goal_result_cb fires with STATUS_CANCELED → calls _pick_and_send
             return
 
-        # No active goal — pick one
-        self._pick_and_send(elapsed)
+        # Hard timeout.
+        if (elapsed - self.current_goal_send_time) > self.goal_timeout:
+            self.get_logger().warn(f'[t={elapsed:.1f}s] Goal timeout — cancelling.')
+            self._remember_failed_goal(elapsed)
+            self._cancel_current_goal()
+            # _goal_result_cb fires → calls _pick_and_send
+            return
 
     def _pick_and_send(self, elapsed):
-        self._nav2_result_received = False
+        """Pick the best unvisited zone and send a Nav2 goal. Call only when no goal is active."""
+        if self.goal_active:
+            self.get_logger().warn(f'[t={elapsed:.1f}s] _pick_and_send called with goal still active — ignoring.')
+            return
+
         target = self._best_zone()
         if target is None:
             self.get_logger().info(f'[t={elapsed:.1f}s] No zone goal available.')
             return
+
         zid, wx, wy, score = target
+
+        if zid in self.visited_zones:
+            self.get_logger().info(
+                f'[t={elapsed:.1f}s] Best zone {zid} already visited — all zones done?')
+            return
+
         self._send_nav_goal(zid, wx, wy, score, elapsed)
 
     def _end_run(self):
@@ -242,7 +269,7 @@ class ZoneExplorer(Node):
         self.stop_pub.publish(zero)
 
     # ------------------------------------------------------------------
-    # Zone tracking
+    # Zone visit detection
     # ------------------------------------------------------------------
 
     def update_visited_zones(self):
@@ -312,28 +339,29 @@ class ZoneExplorer(Node):
     # ------------------------------------------------------------------
 
     def _send_nav_goal(self, zone_id, wx, wy, score, elapsed):
-        yaw = math.atan2(wy - self.robot_y, wx - self.robot_x)
+        arrival_yaw = self._arrival_yaw(wx, wy)
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp    = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = float(wx)
         goal_msg.pose.pose.position.y = float(wy)
-        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
-        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        goal_msg.pose.pose.orientation.z = math.sin(arrival_yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(arrival_yaw / 2.0)
 
         kind  = 'OUTER' if self.is_outer(zone_id) else 'inner'
         outer = sum(1 for z in self.visited_zones if self.is_outer(z))
         self.get_logger().info(
             f'[t={elapsed:.1f}s] → {kind} zone {zone_id} '
-            f'({wx:.2f}, {wy:.2f}) score={score:.2f} [outer done: {outer}/12]'
+            f'({wx:.2f}, {wy:.2f}) score={score:.2f} '
+            f'arrival={math.degrees(arrival_yaw):.0f}° '
+            f'[outer done: {outer}/12]'
         )
 
         self.goal_active            = True
         self.current_goal_zone      = zone_id
         self.current_goal_xy        = (wx, wy)
         self.current_goal_send_time = elapsed
-        self._nav2_result_received  = False
 
         future = self.nav_client.send_goal_async(goal_msg)
         future.add_done_callback(self._goal_response_cb)
@@ -344,14 +372,14 @@ class ZoneExplorer(Node):
         except Exception as exc:
             self.get_logger().error(f'send_goal_async failed: {exc}')
             self.goal_active = False
-            self._nav2_result_received = True
+            self._pick_and_send(self.elapsed())
             return
         if not gh.accepted:
             self.get_logger().warn('Nav2 rejected goal.')
             self._remember_failed_goal(self.elapsed())
-            self.goal_active = False
+            self.goal_active         = False
             self.current_goal_handle = None
-            self._nav2_result_received = True
+            self._pick_and_send(self.elapsed())
             return
         self.current_goal_handle = gh
         gh.get_result_async().add_done_callback(self._goal_result_cb)
@@ -364,12 +392,15 @@ class ZoneExplorer(Node):
             self.get_logger().error(f'get_result_async failed: {exc}')
             self.goal_active         = False
             self.current_goal_handle = None
-            self._nav2_result_received = True
             self._pick_and_send(elapsed)
             return
 
         status = wrapped.status
-        outer  = sum(1 for z in self.visited_zones if self.is_outer(z))
+
+        # Mark any newly visited zones before scoring the next goal.
+        self.update_visited_zones()
+
+        outer = sum(1 for z in self.visited_zones if self.is_outer(z))
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info(
@@ -387,10 +418,9 @@ class ZoneExplorer(Node):
         self.current_goal_handle  = None
         self.current_goal_zone    = None
         self.current_goal_xy      = None
-        self._nav2_result_received = True
 
-        # Immediately pick next zone.
-        self._pick_and_send(elapsed)
+        if not self.run_finished:
+            self._pick_and_send(elapsed)
 
     def _cancel_current_goal(self):
         if self.current_goal_handle is not None:
