@@ -68,8 +68,8 @@ controller_server:
       use_collision_detection: false
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 0.7
-      regulated_linear_scaling_min_speed: 0.10
+      regulated_linear_scaling_min_radius: 0.5
+      regulated_linear_scaling_min_speed: 0.14
       use_rotate_to_heading: true
       max_angular_accel: 3.0
       allow_reversing: false
@@ -108,8 +108,8 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.30
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.25
 
 global_costmap:
   global_costmap:
