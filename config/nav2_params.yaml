@@ -1,7 +1,7 @@
 # =====================================================================
 # Nav2 configuration for ELE434 Team 07 — 4x4 m arena, TurtleBot3 Waffle
-# SIMULATION config — all use_sim_time: true.
-# For real robot: sed -i 's/use_sim_time: true/use_sim_time: false/g'
+# SIMULATION config — all use_sim_time: false.
+# For real robot: sed -i 's/use_sim_time: false/use_sim_time: false/g'
 #
 # Key change: xy_goal_tolerance tightened to 0.20 m (was 0.35).
 # The zone visit detection requires the robot to be within 0.40 m of
@@ -10,16 +10,16 @@
 # With 0.20 m tolerance the robot stops within 0.20 m of the centre,
 # which is well inside the 0.40 m visit radius.
 # =====================================================================
-# last updated 18:38 16/05/2026
+# last updated 11:57 21/05/2026
 
 bt_navigator:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odom
     bt_loop_duration: 10
-    default_server_timeout: 20
+    default_server_timeout: 2000
     wait_for_service_timeout: 1000
     navigators: ["navigate_to_pose", "navigate_through_poses"]
     navigate_to_pose:
@@ -29,7 +29,7 @@ bt_navigator:
 
 controller_server:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
@@ -55,22 +55,22 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.22
+      desired_linear_vel: 0.25
       lookahead_dist: 0.5
       min_lookahead_dist: 0.25
       max_lookahead_dist: 0.8
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.0
+      rotate_to_heading_angular_vel: 1.7
       transform_tolerance: 0.5
       use_velocity_scaled_lookahead_dist: true
-      min_approach_linear_velocity: 0.05
+      min_approach_linear_velocity: 0.1
       approach_velocity_scaling_dist: 0.5
       use_collision_detection: false
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 0.7
-      regulated_linear_scaling_min_speed: 0.10
-      use_rotate_to_heading: false
+      regulated_linear_scaling_min_radius: 0.5
+      regulated_linear_scaling_min_speed: 0.14
+      use_rotate_to_heading: true
       max_angular_accel: 3.0
       allow_reversing: false
       max_robot_pose_search_dist: 10.0
@@ -78,7 +78,7 @@ controller_server:
 local_costmap:
   local_costmap:
     ros__parameters:
-      use_sim_time: true
+      use_sim_time: false
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: odom
@@ -108,13 +108,13 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
+        cost_scaling_factor: 3.0
         inflation_radius: 0.25
 
 global_costmap:
   global_costmap:
     ros__parameters:
-      use_sim_time: true
+      use_sim_time: false
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map
@@ -151,7 +151,7 @@ global_costmap:
 
 planner_server:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     expected_planner_frequency: 5.0
     planner_plugins: ["GridBased"]
 
@@ -163,7 +163,7 @@ planner_server:
 
 behavior_server:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
     local_footprint_topic: local_costmap/published_footprint
@@ -189,12 +189,12 @@ behavior_server:
 
 velocity_smoother:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.22, 0.0, 1.0]
-    min_velocity: [-0.22, 0.0, -1.0]
+    max_velocity: [0.25, 0.0, 1.0]
+    min_velocity: [-0.25, 0.0, -1.0]
     max_accel: [2.5, 0.0, 3.0]
     max_decel: [-2.5, 0.0, -3.0]
     odom_topic: /odom
@@ -204,7 +204,7 @@ velocity_smoother:
 
 waypoint_follower:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     loop_rate: 20
     stop_on_failure: false
     waypoint_task_executor_plugin: "wait_at_waypoint"
@@ -215,7 +215,7 @@ waypoint_follower:
 
 collision_monitor:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     base_frame_id: base_footprint
     odom_frame_id: odom
     cmd_vel_in_topic: cmd_vel_smoothed
@@ -239,7 +239,7 @@ collision_monitor:
 
 docking_server:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     controller_frequency: 50.0
     dock_plugins: ["simple_dock"]
     simple_dock:

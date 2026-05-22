@@ -24,7 +24,7 @@ Zone visit radius:
   meaning the far edge of the robot is at least (0.50 - 0.45 - 0.14)
   = -0.09 m from the zone boundary, i.e. the entire robot is inside.
 """
-# last updated 18:38 16/05/2026
+# last updated 11:57 21/05/2026
 
 import math
 import subprocess
@@ -34,8 +34,11 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
+import tf2_ros
+from tf2_ros import TransformException
+
 from geometry_msgs.msg import TwistStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 
@@ -48,14 +51,13 @@ class ZoneExplorer(Node):
         self.declare_parameter('goal_timeout', 35.0)
         self.declare_parameter('arena_half_size', 2.0)
         self.declare_parameter('zone_size', 1.0)
-        # 0.45 m: robot centre must be 0.45 m from zone centre.
-        # Zone half-width = 0.50 m, robot radius = 0.14 m.
-        # This guarantees the entire robot body is inside the zone.
-        self.declare_parameter('zone_visit_radius', 0.45)
-        self.declare_parameter('outer_zone_bonus', 8.0)
+        # 0.35 m — robot must be within 0.35 m of zone centre to count
+        # as visited (zone half-width is 0.50 m, so robot is well inside).
+        self.declare_parameter('zone_visit_radius', 0.35)
+        self.declare_parameter('outer_zone_bonus', 1.5)
         self.declare_parameter('visited_zone_penalty', 50.0)
         self.declare_parameter('heading_score_gain', 0.10)
-        self.declare_parameter('distance_score_gain', 1.0)
+        self.declare_parameter('distance_score_gain', 3.0)
         self.declare_parameter('failed_goal_penalty', 15.0)
         self.declare_parameter('failed_goal_memory_seconds', 40.0)
         # Filesystem path (without extension) for the saved map.
@@ -85,16 +87,29 @@ class ZoneExplorer(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
-        self.create_subscription(Odometry, '/odom', self._odom_callback, 10)
+        # Robot pose is read from TF (map -> base_footprint), NOT /odom.
+        # /odom is wheel odometry whose origin is wherever the robot was powered
+        # on, which can be metres away from the current SLAM map origin if the
+        # robot has moved between boot and SLAM startup. The map frame is what
+        # Nav2 plans in, so the zone grid must be anchored in the map frame.
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.stop_pub   = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self.map_ready  = False
         self.robot_x    = self.robot_y = self.robot_yaw = 0.0
-        self.odom_ready = False
+        self.tf_ready   = False
 
         self.origin_x = self.origin_y = self.origin_yaw = 0.0
         self.zone_origin_captured = False
+        # Stability check: only anchor the zone frame once we've sampled the
+        # map->base_footprint transform several times and seen it settle. This
+        # prevents anchoring during the brief window when Cartographer's
+        # extrapolator is still initialising and TF can give bogus values.
+        self._anchor_samples = []
+        self._ANCHOR_SAMPLES_REQUIRED = 5
+        self._ANCHOR_STABILITY_TOL    = 0.05  # m, across consecutive samples
 
         self.visited_zones = set()
         self.goal_active            = False
@@ -103,6 +118,21 @@ class ZoneExplorer(Node):
         self.current_goal_xy        = None
         self.current_goal_send_time = 0.0
         self.failed_goals           = []
+        # Track last zone that succeeded without being marked visited,
+        # to detect and break the SUCCEEDED loop.
+        self._last_succeeded_zone   = None
+        self._last_succeeded_count  = 0
+
+        # Consecutive-rejection back-off: if Nav2 keeps rejecting goals
+        # (action server not yet active during startup), wait before retrying.
+        # We track wall-clock time of last rejection and enforce a minimum
+        # gap between retries so we don't hammer a not-yet-active Nav2.
+        self._consecutive_rejections = 0
+        self._last_rejection_wall    = 0.0
+        # Generation counter: incremented each time we send a goal.
+        # Result/response callbacks check their own generation against the
+        # current one; stale callbacks from preempted goals are discarded.
+        self._goal_generation = 0
 
         self.start_time   = self.get_clock().now().nanoseconds * 1e-9
         self.initialized  = False
@@ -157,8 +187,15 @@ class ZoneExplorer(Node):
         return score, wx, wy
 
     def _best_zone(self):
+        # Only outer zones are valid GOALS. Inner zones (-1,-1), (-1,0),
+        # (0,-1), (0,0) carry no marks and the robot has no reason to
+        # navigate TO them. The robot is still free to traverse through
+        # inner zones — Nav2's path planner is unrestricted — but inner
+        # zones never compete with outer zones for "best next goal".
         best, best_score, best_wx, best_wy = None, float('inf'), 0.0, 0.0
         for zid in self._all_zone_ids:
+            if not self.is_outer(zid):
+                continue
             s, wx, wy = self._score(zid)
             if s < best_score:
                 best_score, best, best_wx, best_wy = s, zid, wx, wy
@@ -173,27 +210,96 @@ class ZoneExplorer(Node):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _lookup_pose_in_map(self):
+        """Return (x, y, yaw) of base_footprint in the map frame, or None
+        if the transform is not yet available. Updates self.robot_x/y/yaw
+        as a side effect when successful.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', rclpy.time.Time())
+        except TransformException:
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny, cosy)
+        self.robot_x   = t.x
+        self.robot_y   = t.y
+        self.robot_yaw = yaw
+        self.tf_ready  = True
+        return (t.x, t.y, yaw)
+
+    def _try_anchor_zone_frame(self):
+        """Sample map->base_footprint several times and anchor the zone
+        frame only once the readings have stabilised. Returns True when
+        the zone frame becomes anchored.
+        """
+        if self.zone_origin_captured:
+            return True
+        pose = self._lookup_pose_in_map()
+        if pose is None:
+            return False
+        self._anchor_samples.append(pose)
+        # Keep only the most recent N samples.
+        if len(self._anchor_samples) > self._ANCHOR_SAMPLES_REQUIRED:
+            self._anchor_samples = self._anchor_samples[-self._ANCHOR_SAMPLES_REQUIRED:]
+        if len(self._anchor_samples) < self._ANCHOR_SAMPLES_REQUIRED:
+            return False
+        # Stability check: spread across the window must be < tolerance.
+        xs = [p[0] for p in self._anchor_samples]
+        ys = [p[1] for p in self._anchor_samples]
+        if (max(xs) - min(xs) > self._ANCHOR_STABILITY_TOL or
+                max(ys) - min(ys) > self._ANCHOR_STABILITY_TOL):
+            return False
+        # Sanity: the robot should start inside the arena. If TF is reporting
+        # a pose far from the origin, something has gone wrong (likely SLAM
+        # initialised against a previous session's map, or odom is being
+        # mistakenly used as map). Refuse to anchor rather than place the
+        # zone grid in fictional territory.
+        ax, ay, ayaw = pose
+        if abs(ax) > self.arena_half_size or abs(ay) > self.arena_half_size:
+            self.get_logger().error(
+                f'map->base_footprint reports robot at ({ax:.2f}, {ay:.2f}), '
+                f'which is outside the arena (half-size {self.arena_half_size:.2f}). '
+                f'Refusing to anchor zone frame. Restart SLAM or check TF tree.')
+            # Drop oldest sample so we keep retrying (in case TF recovers).
+            self._anchor_samples = self._anchor_samples[1:]
+            return False
+        self.origin_x   = ax
+        self.origin_y   = ay
+        self.origin_yaw = ayaw
+        self.zone_origin_captured = True
+        self.get_logger().info(
+            f'Zone frame anchored at ({self.origin_x:.2f}, {self.origin_y:.2f}), '
+            f'yaw={math.degrees(self.origin_yaw):.1f} deg '
+            f'(stable across {self._ANCHOR_SAMPLES_REQUIRED} samples).')
+        return True
+
     def _init_tick(self):
         if self.initialized:
             return
-        nav_ready  = self.nav_client.wait_for_server(timeout_sec=0.05)
-        map_ready  = self.map_ready
-        odom_ready = self.zone_origin_captured
+        nav_ready    = self.nav_client.wait_for_server(timeout_sec=0.05)
+        map_ready    = self.map_ready
+        anchor_ready = self._try_anchor_zone_frame()
 
-        if nav_ready and map_ready and odom_ready:
+        if nav_ready and map_ready and anchor_ready:
             self.initialized = True
             self.init_timer.cancel()
             self.start_time = self.get_clock().now().nanoseconds * 1e-9
             # Tick at 0.5 s for visit/timeout monitoring only.
             self.explore_timer = self.create_timer(0.5, self._explore_tick)
             self.get_logger().info(
-                f'Nav2, map, and odom ready — starting zone exploration.\n'
+                f'Nav2, map, and TF ready — starting zone exploration.\n'
                 f'Outer zones: {self._outer_remaining()}'
             )
             self._pick_and_send(0.0)
             return
 
-        missing = [n for n, ok in [('Nav2', nav_ready), ('map', map_ready), ('odom', odom_ready)] if not ok]
+        missing = [n for n, ok in [('Nav2', nav_ready),
+                                   ('map', map_ready),
+                                   ('TF/anchor', anchor_ready)] if not ok]
         self.get_logger().info(f'Still waiting on: {", ".join(missing)}.')
 
     def _explore_tick(self):
@@ -215,22 +321,43 @@ class ZoneExplorer(Node):
         if not self.zone_origin_captured:
             return
 
+        # Refresh robot pose from TF every tick. If TF is briefly stale,
+        # silently keep the last known pose; visit detection will resume
+        # as soon as the next valid transform arrives.
+        self._lookup_pose_in_map()
+
         self.update_visited_zones()
         self._prune_failed_goals(elapsed)
 
         if not self.goal_active:
-            # Guard: no active goal outside startup — shouldn't happen normally.
-            self.get_logger().warn(
-                f'[t={elapsed:.1f}s] No active goal in tick — re-sending.')
-            self._pick_and_send(elapsed)
+            # Guard: no active goal. Either we're just starting up (Nav2 not
+            # yet active, back-off applies) or something dropped a goal.
+            import time as _wtime
+            now_wall = _wtime.monotonic()
+            backoff  = min(0.2 * self._consecutive_rejections, 2.0)
+            if now_wall - self._last_rejection_wall >= backoff:
+                self._pick_and_send(elapsed)
             return
 
-        # Cancel if target zone visited en-route.
+        # Zone visited en-route — preempt with next goal immediately.
+        # Sending a new goal to Nav2 while one is active is a preemption;
+        # Nav2 cancels the old goal internally. This avoids the cancel
+        # round-trip that causes a visible pause on the real robot.
         if (self.current_goal_zone is not None
                 and self.current_goal_zone in self.visited_zones):
             self.get_logger().info(
                 f'[t={elapsed:.1f}s] Zone {self.current_goal_zone} '
-                f'visited en-route — cancelling.')
+                f'visited en-route — preempting with next goal.')
+            target = self._best_zone()
+            if target is not None:
+                zid, wx, wy, score = target
+                if zid not in self.visited_zones:
+                    # Preempt: mark old goal as cancelled internally, send new
+                    self.current_goal_handle = None
+                    self.goal_active = False
+                    self._send_nav_goal(zid, wx, wy, score, elapsed)
+                    return
+            # No better zone found — just cancel
             self._cancel_current_goal()
             return
 
@@ -313,13 +440,16 @@ class ZoneExplorer(Node):
             dist = math.hypot(self.robot_x - wx, self.robot_y - wy)
             if dist <= self.zone_visit_radius:
                 self.visited_zones.add(zid)
-                kind  = 'OUTER' if self.is_outer(zid) else 'inner'
-                outer = sum(1 for z in self.visited_zones if self.is_outer(z))
-                self.get_logger().info(
-                    f'[t={self.elapsed():.1f}s] ✓ {kind} zone {zid} '
-                    f'(dist={dist:.2f}m). Outer: {outer}/12. '
-                    f'Remaining: {self._outer_remaining()}'
-                )
+                # Only outer zones count for marks — only log those. Inner
+                # zones are still added to visited_zones (the en-route
+                # preemption check uses it) but their traversal is silent.
+                if self.is_outer(zid):
+                    outer = sum(1 for z in self.visited_zones if self.is_outer(z))
+                    self.get_logger().info(
+                        f'[t={self.elapsed():.1f}s] ✓ OUTER zone {zid} '
+                        f'(dist={dist:.2f}m). Outer: {outer}/12. '
+                        f'Remaining: {self._outer_remaining()}'
+                    )
 
     # ------------------------------------------------------------------
     # Failed-goal blacklist
@@ -344,23 +474,6 @@ class ZoneExplorer(Node):
     # ------------------------------------------------------------------
     # ROS callbacks
     # ------------------------------------------------------------------
-
-    def _odom_callback(self, msg: Odometry):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.robot_yaw = math.atan2(siny, cosy)
-        if not self.zone_origin_captured:
-            self.origin_x   = self.robot_x
-            self.origin_y   = self.robot_y
-            self.origin_yaw = self.robot_yaw
-            self.zone_origin_captured = True
-            self.get_logger().info(
-                f'Zone frame anchored at ({self.origin_x:.2f}, {self.origin_y:.2f}), '
-                f'yaw={math.degrees(self.origin_yaw):.1f} deg.')
-        self.odom_ready = True
 
     def _map_callback(self, msg: OccupancyGrid):
         self.map_ready = True
@@ -394,10 +507,15 @@ class ZoneExplorer(Node):
         self.current_goal_xy        = (wx, wy)
         self.current_goal_send_time = elapsed
 
+        self._goal_generation += 1
+        my_gen = self._goal_generation
         future = self.nav_client.send_goal_async(goal_msg)
-        future.add_done_callback(self._goal_response_cb)
+        future.add_done_callback(lambda f, g=my_gen: self._goal_response_cb(f, g))
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, my_gen=None):
+        # Discard callbacks from goals that have been superseded.
+        if my_gen is not None and my_gen != self._goal_generation:
+            return
         try:
             gh = future.result()
         except Exception as exc:
@@ -406,17 +524,31 @@ class ZoneExplorer(Node):
             self._pick_and_send(self.elapsed())
             return
         if not gh.accepted:
-            self.get_logger().warn('Nav2 rejected goal.')
-            self._remember_failed_goal(self.elapsed())
+            import time as _wtime
+            self._consecutive_rejections += 1
+            self._last_rejection_wall = _wtime.monotonic()
+            # Don't log every rejection during startup — only every 5th
+            if self._consecutive_rejections % 5 == 1:
+                self.get_logger().warn(
+                    f'Nav2 rejected goal (#{self._consecutive_rejections}) '
+                    f'— Nav2 not yet active. Will retry...')
             self.goal_active         = False
             self.current_goal_handle = None
-            self._pick_and_send(self.elapsed())
+            # Record rejection time — _explore_tick will retry once
+            # enough wall time has elapsed (back-off, no timer spam).
+            import time as _wtime
+            self._last_rejection_wall = _wtime.monotonic()
             return
+        self._consecutive_rejections = 0  # Nav2 is active and accepting goals
         self.current_goal_handle = gh
-        gh.get_result_async().add_done_callback(self._goal_result_cb)
+        gh.get_result_async().add_done_callback(
+            lambda f, g=my_gen: self._goal_result_cb(f, g))
 
-    def _goal_result_cb(self, future):
+    def _goal_result_cb(self, future, my_gen=None):
         elapsed = self.elapsed()
+        # Discard stale callbacks from superseded goals.
+        if my_gen is not None and my_gen != self._goal_generation:
+            return
         try:
             wrapped = future.result()
         except Exception as exc:
@@ -432,18 +564,52 @@ class ZoneExplorer(Node):
         self.update_visited_zones()
 
         outer = sum(1 for z in self.visited_zones if self.is_outer(z))
+        completed_zone = self.current_goal_zone
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info(
                 f'[t={elapsed:.1f}s] Goal SUCCEEDED. Outer: {outer}/12. '
                 f'Remaining: {self._outer_remaining()}')
+            # Loop-break: if Nav2 keeps declaring success for the same zone
+            # without us marking it visited, force-visit it. This happens when
+            # the robot stops just outside zone_visit_radius (e.g. 0.46 m vs
+            # 0.50 m threshold) but Nav2 considers it close enough to the goal.
+            if completed_zone is not None and completed_zone not in self.visited_zones:
+                if self._last_succeeded_zone == completed_zone:
+                    self._last_succeeded_count += 1
+                else:
+                    self._last_succeeded_zone  = completed_zone
+                    self._last_succeeded_count = 1
+
+                if self._last_succeeded_count >= 2:
+                    # Robot is stuck near the goal but not quite inside — force visit.
+                    self.get_logger().warn(
+                        f'[t={elapsed:.1f}s] Zone {completed_zone} succeeded '
+                        f'{self._last_succeeded_count}x without visit — force-marking visited.')
+                    self.visited_zones.add(completed_zone)
+                    kind = 'OUTER' if self.is_outer(completed_zone) else 'inner'
+                    outer = sum(1 for z in self.visited_zones if self.is_outer(z))
+                    self.get_logger().info(
+                        f'[t={elapsed:.1f}s] ✓ {kind} zone {completed_zone} (force). '
+                        f'Outer: {outer}/12. Remaining: {self._outer_remaining()}')
+                    self._last_succeeded_zone  = None
+                    self._last_succeeded_count = 0
+            else:
+                self._last_succeeded_zone  = None
+                self._last_succeeded_count = 0
         elif status == GoalStatus.STATUS_ABORTED:
             self.get_logger().warn(f'[t={elapsed:.1f}s] Goal ABORTED. Outer: {outer}/12.')
             self._remember_failed_goal(elapsed)
+            self._last_succeeded_zone  = None
+            self._last_succeeded_count = 0
         elif status == GoalStatus.STATUS_CANCELED:
             self.get_logger().info(f'[t={elapsed:.1f}s] Goal CANCELED.')
+            self._last_succeeded_zone  = None
+            self._last_succeeded_count = 0
         else:
             self.get_logger().info(f'[t={elapsed:.1f}s] Goal status={status}.')
+            self._last_succeeded_zone  = None
+            self._last_succeeded_count = 0
 
         self.goal_active          = False
         self.current_goal_handle  = None

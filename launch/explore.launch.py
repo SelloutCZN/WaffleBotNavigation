@@ -27,7 +27,7 @@ Real robot (default):
 Simulation:
     ros2 launch ele434_team07_2026 explore.launch.py use_sim_time:=true
 """
-# last updated 18:38 16/05/2026
+# last updated 11:20 21/05/2026
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -128,11 +128,24 @@ def generate_launch_description():
             'goal_timeout': 35.0,
             'arena_half_size': 2.0,
             'zone_size': 1.0,
-            'zone_visit_radius': 0.45,
-            'outer_zone_bonus': 8.0,
+            # Tightened to 0.35 — robot must be deeper inside the zone
+            # (within 0.35 m of the 0.50 m half-width zone) before it
+            # counts as visited. Combined with xy_goal_tolerance: 0.20
+            # in nav2_params.yaml this keeps Nav2 happy while requiring
+            # the robot to be well inside the zone.
+            'zone_visit_radius': 0.35,
+            # Outer bonus reduced from 8.0 → 1.5. Was dominating the
+            # score so much that the robot would skip nearby outer zones
+            # to chase distant ones. Now an outer zone 1 m away beats an
+            # outer zone 3 m away (1+0-1.5=-0.5 vs 3+0-1.5=+1.5).
+            'outer_zone_bonus': 1.5,
+            # Distance gain raised from 1.0 → 3.0. Strongest signal now
+            # is "go to the nearest unvisited zone".
+            'distance_score_gain': 3.0,
+            # Visited penalty kept high to avoid picking visited zones
+            # as the destination.
             'visited_zone_penalty': 50.0,
             'heading_score_gain': 0.10,
-            'distance_score_gain': 1.0,
             'failed_goal_penalty': 15.0,
             'failed_goal_memory_seconds': 40.0,
             # Path to write the map when the run ends.
